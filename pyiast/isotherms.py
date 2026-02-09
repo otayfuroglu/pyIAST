@@ -25,8 +25,10 @@ import pandas as pd
 _VERSION = "1.4.3"
 
 # ! list of models implemented in pyIAST
+
 _MODELS = [
-    "Langmuir", "Quadratic", "BET", "Henry", "TemkinApprox", "DSLangmuir"
+    "Langmuir", "Quadratic", "BET", "Henry", "TemkinApprox", "DSLangmuir",
+    "DualSiteMF"
 ]
 
 # ! dictionary of parameters involved in each model
@@ -51,6 +53,15 @@ _MODEL_PARAMS = {
         "M2": np.nan,
         "K2": np.nan
     },
+    "DualSiteMF": {
+        "M1": np.nan,
+        "K1": np.nan,
+        "a1": np.nan,
+        "M2": np.nan,
+        "K2": np.nan,
+        "a2": np.nan
+    },
+
     "TemkinApprox": {
         "M": np.nan,
         "K": np.nan,
@@ -115,6 +126,16 @@ def get_default_guess_params(model, df, pressure_key, loading_key):
             "K1": 0.4 * langmuir_k,
             "M2": 0.5 * saturation_loading,
             "K2": 0.6 * langmuir_k
+        }
+
+    if model == "DualSiteMF":
+        return {
+            "M1": 0.5 * saturation_loading,
+            "K1": 0.5 * langmuir_k,
+            "a1": 1.0,
+            "M2": 0.5 * saturation_loading,
+            "K2": 1.5 * langmuir_k,
+            "a2": 1.0
         }
 
     if model == "Henry":
@@ -275,6 +296,12 @@ class ModelIsotherm:
             return self.params["M1"] * k1p / (1.0 + k1p) + \
                    self.params["M2"] * k2p / (1.0 + k2p)
 
+        if self.model == "DualSiteMF":
+            k1p = (self.params["K1"] * pressure) ** self.params["a1"]
+            k2p = (self.params["K2"] * pressure) ** self.params["a2"]
+            return self.params["M1"] * k1p / (1.0 + k1p) + \
+                   self.params["M2"] * k2p / (1.0 + k2p)
+
         if self.model == "Henry":
             return self.params["KH"] * pressure
 
@@ -311,8 +338,19 @@ class ModelIsotherm:
                 self.df[self.pressure_key].values))**2)
 
         # minimize RSS
+                # add bounds for DualSiteMF to avoid nonphysical params
+        if self.model == "DualSiteMF":
+            bounds = [(1e-12, None)] * len(guess)
+        else:
+            bounds = None
+
         opt_res = scipy.optimize.minimize(
-            residual_sum_of_squares, guess, method=optimization_method)
+            residual_sum_of_squares,
+            guess,
+            method=optimization_method,
+            bounds=bounds
+        )
+
         if not opt_res.success:
             print((opt_res.message))
             print(("\n\tDefault starting guess for parameters:",
@@ -364,6 +402,12 @@ class ModelIsotherm:
                 1.0 + self.params["K1"] * pressure) +\
                    self.params["M2"] * np.log(
                        1.0 + self.params["K2"] * pressure)
+
+        if self.model == "DualSiteMF":
+            return (self.params["M1"] / self.params["a1"]) * np.log(
+                1.0 + (self.params["K1"] * pressure) ** self.params["a1"]) + \
+                   (self.params["M2"] / self.params["a2"]) * np.log(
+                1.0 + (self.params["K2"] * pressure) ** self.params["a2"])
 
         if self.model == "Henry":
             return self.params["KH"] * pressure
