@@ -27,8 +27,8 @@ _VERSION = "1.4.3"
 # ! list of models implemented in pyIAST
 
 _MODELS = [
-    "Langmuir", "Quadratic", "BET", "Henry", "TemkinApprox", "DSLangmuir",
-    "DualSiteMF"
+    "Langmuir", "Quadratic", "BET", "Henry", "TemkinApprox",
+    "DSLangmuir", "DualSiteSip", "DualSiteMF"
 ]
 
 # ! dictionary of parameters involved in each model
@@ -53,13 +53,22 @@ _MODEL_PARAMS = {
         "M2": np.nan,
         "K2": np.nan
     },
-    "DualSiteMF": {
+    "DualSiteSip": {
         "M1": np.nan,
         "K1": np.nan,
         "a1": np.nan,
         "M2": np.nan,
         "K2": np.nan,
         "a2": np.nan
+    },
+
+    "DualSiteMF": {
+        "q1": np.nan,   # saturation loading site 1
+        "K1s": np.nan,  # K1* (1/pressure)
+        "J1": np.nan,   # mean-field interaction parameter
+        "q2": np.nan,
+        "K2s": np.nan,
+        "J2": np.nan
     },
 
     "TemkinApprox": {
@@ -128,7 +137,7 @@ def get_default_guess_params(model, df, pressure_key, loading_key):
             "K2": 0.6 * langmuir_k
         }
 
-    if model == "DualSiteMF":
+    if model == "DualSiteSip":
         return {
             "M1": 0.5 * saturation_loading,
             "K1": 0.5 * langmuir_k,
@@ -136,6 +145,16 @@ def get_default_guess_params(model, df, pressure_key, loading_key):
             "M2": 0.5 * saturation_loading,
             "K2": 1.5 * langmuir_k,
             "a2": 1.0
+        }
+
+    if model == "DualSiteMF":
+        return {
+            "q1": 0.5 * saturation_loading,
+            "K1s": 0.4 * langmuir_k,
+            "J1": 0.0,   # start from no-interaction (reduces to DSLangmuir-like)
+            "q2": 0.5 * saturation_loading,
+            "K2s": 0.6 * langmuir_k,
+            "J2": 0.0
         }
 
     if model == "Henry":
@@ -296,11 +315,25 @@ class ModelIsotherm:
             return self.params["M1"] * k1p / (1.0 + k1p) + \
                    self.params["M2"] * k2p / (1.0 + k2p)
 
-        if self.model == "DualSiteMF":
+        if self.model == "DualSiteSip":
             k1p = (self.params["K1"] * pressure) ** self.params["a1"]
             k2p = (self.params["K2"] * pressure) ** self.params["a2"]
             return self.params["M1"] * k1p / (1.0 + k1p) + \
                    self.params["M2"] * k2p / (1.0 + k2p)
+
+        if self.model == "DualSiteMF":
+            P = np.asarray(pressure, dtype=float)
+
+            def site_loading(q, Ks, J):
+                # theta based on Ks (as in your figure)
+                theta = (Ks * P) / (1.0 + Ks * P)        # in [0,1)
+                expo = np.clip(J * theta, -50.0, 50.0)   # avoid overflow
+                Keff = Ks * np.exp(expo)
+                return q * (Keff * P) / (1.0 + Keff * P)
+
+            q1 = site_loading(self.params["q1"], self.params["K1s"], self.params["J1"])
+            q2 = site_loading(self.params["q2"], self.params["K2s"], self.params["J2"])
+            return q1 + q2
 
         if self.model == "Henry":
             return self.params["KH"] * pressure
@@ -338,9 +371,20 @@ class ModelIsotherm:
                 self.df[self.pressure_key].values))**2)
 
         # minimize RSS
-                # add bounds for DualSiteMF to avoid nonphysical params
-        if self.model == "DualSiteMF":
+        if self.model == "DualSiteSip":
             bounds = [(1e-12, None)] * len(guess)
+                # Bounds improve stability for flexible models
+
+        # add bounds for DualSiteMF to avoid nonphysical params
+        if self.model == "DualSiteMF":
+            bounds = []
+            for name in param_names:
+                if name in ["q1", "q2", "K1s", "K2s"]:
+                    bounds.append((1e-12, None))
+                elif name in ["J1", "J2"]:
+                    bounds.append((-20.0, 20.0))  # tighten if needed
+                else:
+                    bounds.append((None, None))
         else:
             bounds = None
 
@@ -403,11 +447,56 @@ class ModelIsotherm:
                    self.params["M2"] * np.log(
                        1.0 + self.params["K2"] * pressure)
 
-        if self.model == "DualSiteMF":
+        if self.model == "DualSiteSip":
             return (self.params["M1"] / self.params["a1"]) * np.log(
                 1.0 + (self.params["K1"] * pressure) ** self.params["a1"]) + \
                    (self.params["M2"] / self.params["a2"]) * np.log(
                 1.0 + (self.params["K2"] * pressure) ** self.params["a2"])
+
+        if self.model == "DualSiteMF":
+            # Numerical quadrature: Pi(P) = ∫_0^P q(p)/p dp
+            # Handle near-zero behavior safely using Henry slope approximation.
+            P = float(pressure)
+            if P <= 0.0:
+                return 0.0
+
+            # small cutoff to avoid division by zero in integrand
+            eps = 1e-12 * max(1.0, P)
+
+            # approximate Henry constant from a tiny pressure
+            p0 = min(1e-8 * max(1.0, P), 1e-8)
+            q0 = float(self.loading(p0))
+            KH = q0 / p0 if p0 > 0 else 0.0
+
+            def integrand(p):
+                if p <= eps:
+                    return KH  # because q(p)/p -> KH
+                return float(self.loading(p) / p)
+
+            val, _ = scipy.integrate.quad(integrand, 0.0, P, limit=200)
+            return val
+
+        if self.model == "DualSiteMF":
+            P = float(pressure)
+            if P <= 0.0:
+                return 0.0
+
+            # Exact Henry-limit slope for THIS MF form:
+            # As P->0: Keff -> Ks, so q ~ q1*K1s*P + q2*K2s*P  (independent of J)
+            KH = self.params["q1"] * self.params["K1s"] + self.params["q2"] * self.params["K2s"]
+
+            # integrate Pi(P) = ∫0^P q(p)/p dp
+            # handle p~0 analytically: q/p -> KH
+            eps = 1e-12 * max(1.0, P)
+            if P <= eps:
+                return KH * P
+
+            def integrand(p):
+                # p is scalar float
+                return float(self.loading(p) / p)
+
+            val, _ = scipy.integrate.quad(integrand, eps, P, limit=300)
+            return KH * eps + val
 
         if self.model == "Henry":
             return self.params["KH"] * pressure
